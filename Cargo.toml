@@ -1,0 +1,15 @@
+[package]
+name = "velf"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+crossterm = "0.29.0"
+gimli = "0.34.0"
+goblin = "0.10.7"
+iced-x86 = { version = "1.21.0", features = ["decoder", "encoder"] }
+nix = { version = "0.31.3", features = ["ptrace", "process", "signal"] }
+object = "0.40.0"
+petgraph = "0.8.3"
+ratatui = "0.30.2"
