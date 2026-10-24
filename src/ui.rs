@@ -13,6 +13,7 @@ use crate::memmap::MemoryMap;
 use crate::reloc::RelocEntry;
 use crate::strings::StringEntry;
 use crate::symbols::UnifiedSymbol;
+use crate::theme::{to_color, Theme};
 use crate::vim::{JumpStack, UndoStack, VimMode};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -111,6 +112,28 @@ pub struct AppState {
 
     /* source-line annotation toggle */
     pub show_source_lines: bool,
+
+    /* cached disassembly window for zero-latency frame rendering */
+    pub cached_disasm: Vec<crate::arch::DecodedInstruction>,
+    pub cached_disasm_anchor: Option<(usize, usize)>,
+    pub cached_func_symbols: Vec<crate::elf::SymbolInfo>,
+    pub cached_xref_map: Option<crate::xref::XrefMap>,
+
+    /* pending key chord state machine (e.g. 'g', 'c', ']', '[') */
+    pub pending_chord: Option<char>,
+
+    /* customizable color theme and syntax palette */
+    pub theme: Theme,
+
+    /* high-performance instruction cache mapping file offsets to decoded instructions */
+    pub instruction_cache: crate::arch::InstructionCache,
+
+    /* virtualized disassembly viewport anchor */
+    pub disasm_viewport_top: usize,
+
+    /* asynchronous parallel background worker spinner state */
+    pub bg_task_spinner: usize,
+    pub bg_task_status: Option<String>,
 }
 
 impl AppState {
@@ -122,8 +145,12 @@ impl AppState {
         let sec_report = SecurityReport::scan(&elf);
         let dwarf = DwarfIndex::parse_from_bytes(&elf.bytes);
         let caves = crate::codecave::scan_code_caves(&elf, 16);
+        let cached_funcs: Vec<crate::elf::SymbolInfo> = elf.find_function_symbols().into_iter().cloned().collect();
 
-        Self {
+        let mut inst_cache = crate::arch::InstructionCache::new(4096);
+        inst_cache.preindex_range(&elf.bytes, entry_offset, entry_va, 300);
+
+        let mut state = Self {
             elf,
             mode: VimMode::Normal,
             center_view: CenterView::Disassembly,
@@ -176,7 +203,105 @@ impl AppState {
             undo_stack: UndoStack::new(),
 
             show_source_lines: true,
+
+            cached_disasm: Vec::new(),
+            cached_disasm_anchor: None,
+            cached_func_symbols: cached_funcs,
+            cached_xref_map: None,
+            pending_chord: None,
+
+            theme: Theme::nord(),
+            instruction_cache: inst_cache,
+            disasm_viewport_top: entry_offset,
+            bg_task_spinner: 0,
+            bg_task_status: None,
+        };
+
+        state.update_disassembly_cache();
+        state
+    }
+
+    /*
+     * update virtualized disassembly viewport around current cursor location.
+     * Uses InstructionCache to decode and fetch strictly the ~45 lines needed for the viewport,
+     * maintaining sub-millisecond frame rendering without re-decoding whole sections.
+     */
+    pub fn update_disassembly_cache(&mut self) {
+        let (start_off, size, base_va) = match self.elf.find_section_at_offset(self.cursor_file_offset) {
+            Some(s) if s.is_executable => (s.sh_offset as usize, s.sh_size as usize, s.sh_addr),
+            _ => {
+                let first_exec = self.elf.sections.iter().find(|s| s.is_executable && s.sh_size > 0);
+                match first_exec {
+                    Some(s) => (s.sh_offset as usize, s.sh_size as usize, s.sh_addr),
+                    None => (0, self.elf.bytes.len().min(4096), 0x400000),
+                }
+            }
+        };
+
+        let viewport_lines = 45;
+
+        /* if viewport top is outside the current executable section, reset to cursor */
+        if self.disasm_viewport_top < start_off || self.disasm_viewport_top >= start_off + size {
+            self.disasm_viewport_top = self.cursor_file_offset;
         }
+
+        /* if cursor scrolled above viewport top, bring viewport top up to cursor */
+        if self.cursor_file_offset < self.disasm_viewport_top {
+            self.disasm_viewport_top = self.cursor_file_offset;
+        }
+
+        /* pre-decode a localized window starting at disasm_viewport_top */
+        let top_va = if base_va > 0 && self.disasm_viewport_top >= start_off {
+            base_va + (self.disasm_viewport_top - start_off) as u64
+        } else {
+            self.elf.offset_to_va(self.disasm_viewport_top).unwrap_or(0x400000)
+        };
+
+        self.instruction_cache.preindex_range(&self.elf.bytes, self.disasm_viewport_top, top_va, viewport_lines);
+
+        let mut lines = Vec::with_capacity(viewport_lines);
+        let mut cur_off = self.disasm_viewport_top;
+        let mut cur_va = top_va;
+
+        while cur_off < self.elf.bytes.len() && lines.len() < viewport_lines {
+            if let Some(instr) = self.instruction_cache.get_or_decode(&self.elf.bytes, cur_off, cur_va) {
+                let len = instr.len;
+                cur_off += len;
+                cur_va += len as u64;
+                lines.push(instr);
+            } else {
+                break;
+            }
+        }
+
+        /* if cursor is beyond bottom of current viewport window, scroll viewport down */
+        if let Some(last) = lines.last() {
+            if self.cursor_file_offset >= last.file_offset + last.len {
+                self.disasm_viewport_top = self.cursor_file_offset;
+                let new_top_va = if base_va > 0 && self.disasm_viewport_top >= start_off {
+                    base_va + (self.disasm_viewport_top - start_off) as u64
+                } else {
+                    self.elf.offset_to_va(self.disasm_viewport_top).unwrap_or(0x400000)
+                };
+                self.instruction_cache.preindex_range(&self.elf.bytes, self.disasm_viewport_top, new_top_va, viewport_lines);
+                lines.clear();
+                let mut c_off = self.disasm_viewport_top;
+                let mut c_va = new_top_va;
+                while c_off < self.elf.bytes.len() && lines.len() < viewport_lines {
+                    if let Some(instr) = self.instruction_cache.get_or_decode(&self.elf.bytes, c_off, c_va) {
+                        let len = instr.len;
+                        c_off += len;
+                        c_va += len as u64;
+                        lines.push(instr);
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+
+        self.cached_disasm = lines;
+        self.cached_disasm_anchor = Some((start_off, size));
     }
 
     /* set statusline notification */
@@ -232,7 +357,11 @@ pub fn render_ui(frame: &mut Frame, state: &mut AppState) {
 /* render left sidebar containing sections and symbols */
 fn render_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
     let is_focused = state.active_pane == 0;
-    let border_color = if is_focused { Color::Cyan } else { Color::DarkGray };
+    let border_color = if is_focused {
+        to_color(state.theme.palette.border_active)
+    } else {
+        to_color(state.theme.palette.border)
+    };
 
     let sidebar_layout = Layout::default()
         .direction(Direction::Vertical)
@@ -248,11 +377,14 @@ fn render_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
         .map(|(i, s)| {
             let exec_tag = if s.is_executable { "[X]" } else { "   " };
             let style = if is_focused && state.sidebar_index == i {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(to_color(state.theme.palette.cursor_fg))
+                    .bg(to_color(state.theme.palette.cursor_bg))
+                    .add_modifier(Modifier::BOLD)
             } else if s.is_executable {
-                Style::default().fg(Color::Green)
+                Style::default().fg(to_color(state.theme.palette.entropy_low))
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(to_color(state.theme.palette.foreground))
             };
             ListItem::new(format!("{:2} {} {:<14} 0x{:08x}", i, exec_tag, s.name, s.sh_addr)).style(style)
         })
@@ -267,12 +399,12 @@ fn render_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
     frame.render_widget(sec_list, sidebar_layout[0]);
 
     /* 2. Functions (STT_FUNC) list */
-    let funcs = state.elf.find_function_symbols();
-    let func_items: Vec<ListItem> = funcs
+    let func_items: Vec<ListItem> = state
+        .cached_func_symbols
         .iter()
         .take(100)
         .map(|f| {
-            let style = Style::default().fg(Color::Cyan);
+            let style = Style::default().fg(to_color(state.theme.palette.branch_target));
             ListItem::new(format!("0x{:08x} {}", f.st_value, f.name)).style(style)
         })
         .collect();
@@ -281,7 +413,7 @@ fn render_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(border_color))
-            .title(format!(" Functions ({}) ", funcs.len())),
+            .title(format!(" Functions ({}) ", state.cached_func_symbols.len())),
     );
     frame.render_widget(func_list, sidebar_layout[1]);
 }
@@ -289,7 +421,11 @@ fn render_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
 /* render central pane based on active view mode */
 fn render_center(frame: &mut Frame, state: &mut AppState, area: Rect) {
     let is_focused = state.active_pane == 1;
-    let border_color = if is_focused { Color::Cyan } else { Color::DarkGray };
+    let border_color = if is_focused {
+        to_color(state.theme.palette.border_active)
+    } else {
+        to_color(state.theme.palette.border)
+    };
 
     let block_title = match state.center_view {
         CenterView::Disassembly => " [2] Disassembly (x86_64 Intel) ",
@@ -324,40 +460,29 @@ fn render_center(frame: &mut Frame, state: &mut AppState, area: Rect) {
     }
 }
 
-/* render linear disassembly view */
+/* render linear disassembly view using virtualized viewport and theme palette */
 fn render_disassembly_view(frame: &mut Frame, state: &AppState, area: Rect) {
-    let sec = state.elf.find_section_at_offset(state.cursor_file_offset);
-    let (start_off, size, base_va) = match sec {
-        Some(s) if s.is_executable => (s.sh_offset as usize, s.sh_size as usize, s.sh_addr),
-        _ => {
-            /* if not currently in executable section, find first executable section */
-            let first_exec = state.elf.sections.iter().find(|s| s.is_executable && s.sh_size > 0);
-            match first_exec {
-                Some(s) => (s.sh_offset as usize, s.sh_size as usize, s.sh_addr),
-                None => (0, state.elf.bytes.len().min(4096), 0x400000),
-            }
-        }
-    };
-
-    let end_off = (start_off + size).min(state.elf.bytes.len());
-    let slice = &state.elf.bytes[start_off..end_off];
-    let instructions = crate::arch::disassemble_slice(slice, base_va, start_off);
-
     let visible_rows = area.height as usize;
-    let mut lines = Vec::new();
+    if state.cached_disasm.is_empty() {
+        let p = Paragraph::new("No executable instructions found in current section.")
+            .style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(p, area);
+        return;
+    }
 
-    for (i, instr) in instructions.iter().enumerate() {
-        if i < state.center_scroll_offset || lines.len() >= visible_rows {
-            continue;
-        }
+    let mut lines = Vec::with_capacity(visible_rows);
 
-        let is_selected = instr.file_offset == state.cursor_file_offset;
+    for instr in state.cached_disasm.iter().take(visible_rows) {
+        let is_selected = instr.file_offset <= state.cursor_file_offset && state.cursor_file_offset < instr.file_offset + instr.len;
 
         /* optional DWARF source line annotation */
         if state.show_source_lines {
             if let Some(src_loc) = state.dwarf_index.lookup(instr.va) {
                 lines.push(Line::from(vec![
-                    Span::styled(format!("  ; {}:{}", src_loc.file_path, src_loc.line), Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("  ; {}:{}", src_loc.file_path, src_loc.line),
+                        Style::default().fg(to_color(state.theme.palette.source_line)),
+                    ),
                 ]));
             }
         }
@@ -371,34 +496,18 @@ fn render_disassembly_view(frame: &mut Frame, state: &AppState, area: Rect) {
             continue;
         }
 
-        let hex_bytes = instr
-            .bytes
-            .iter()
-            .map(|b| format!("{:02x}", b))
-            .collect::<Vec<_>>()
-            .join(" ");
+        let mut spans = Vec::with_capacity(6);
+        spans.push(Span::styled(
+            format!("0x{:08x}  ", instr.va),
+            Style::default().fg(to_color(state.theme.palette.hex_offset)),
+        ));
+        spans.push(Span::styled(
+            format!("{:<18} ", &instr.formatted_hex),
+            Style::default().fg(to_color(state.theme.palette.hex_nonprintable)),
+        ));
 
-        let (mnemonic_style, op_style) = if is_selected {
-            (
-                Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD),
-                Style::default().fg(Color::Black).bg(Color::Yellow),
-            )
-        } else if instr.is_call() {
-            (Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD), Style::default().fg(Color::White))
-        } else if instr.is_conditional_branch() || instr.is_unconditional_branch() {
-            (Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD), Style::default().fg(Color::White))
-        } else if instr.is_return() {
-            (Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD), Style::default().fg(Color::White))
-        } else {
-            (Style::default().fg(Color::White).add_modifier(Modifier::BOLD), Style::default().fg(Color::LightCyan))
-        };
-
-        lines.push(Line::from(vec![
-            Span::styled(format!("0x{:08x}  ", instr.va), Style::default().fg(Color::DarkGray)),
-            Span::styled(format!("{:<18} ", hex_bytes), Style::default().fg(Color::Gray)),
-            Span::styled(format!("{:<8} ", instr.mnemonic), mnemonic_style),
-            Span::styled(instr.op_str.clone(), op_style),
-        ]));
+        spans.extend(instr.format_spans(&state.theme.palette, is_selected));
+        lines.push(Line::from(spans));
     }
 
     let p = Paragraph::new(lines);
@@ -890,10 +999,14 @@ fn render_live_debug_view(frame: &mut Frame, state: &AppState, area: Rect) {
     frame.render_widget(bp_list, split[1]);
 }
 
-/* render synchronized Hex and ASCII dump pane */
+/* render synchronized Hex and ASCII dump pane with zero-allocation byte formatting */
 fn render_hex_dump(frame: &mut Frame, state: &AppState, area: Rect) {
     let is_focused = state.active_pane == 2;
-    let border_color = if is_focused { Color::Cyan } else { Color::DarkGray };
+    let border_color = if is_focused {
+        to_color(state.theme.palette.border_active)
+    } else {
+        to_color(state.theme.palette.border)
+    };
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -904,7 +1017,7 @@ fn render_hex_dump(frame: &mut Frame, state: &AppState, area: Rect) {
     frame.render_widget(block, area);
 
     let rows_count = inner.height as usize;
-    let mut lines = Vec::new();
+    let mut lines = Vec::with_capacity(rows_count);
 
     for row_idx in 0..rows_count {
         let row_offset = state.hex_scroll_offset + row_idx * 16;
@@ -912,11 +1025,14 @@ fn render_hex_dump(frame: &mut Frame, state: &AppState, area: Rect) {
             break;
         }
 
-        let mut spans = Vec::new();
-        spans.push(Span::styled(format!("{:06x}  ", row_offset), Style::default().fg(Color::DarkGray)));
+        let mut spans = Vec::with_capacity(19);
+        spans.push(Span::styled(
+            format!("{:06x}  ", row_offset),
+            Style::default().fg(to_color(state.theme.palette.hex_offset)),
+        ));
 
-        /* 16 hex byte pairs */
-        let mut ascii_chars = String::new();
+        /* 16 hex byte pairs using static lookup table (zero heap allocations) */
+        let mut ascii_chars = String::with_capacity(16);
         for col in 0..16 {
             let byte_off = row_offset + col;
             if byte_off < state.elf.bytes.len() {
@@ -924,16 +1040,19 @@ fn render_hex_dump(frame: &mut Frame, state: &AppState, area: Rect) {
                 let is_cursor = byte_off == state.cursor_file_offset;
 
                 let style = if is_cursor {
-                    Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(to_color(state.theme.palette.cursor_fg))
+                        .bg(to_color(state.theme.palette.cursor_bg))
+                        .add_modifier(Modifier::BOLD)
                 } else if b == 0x00 {
-                    Style::default().fg(Color::DarkGray)
+                    Style::default().fg(to_color(state.theme.palette.hex_zero))
                 } else if b == 0x90 {
-                    Style::default().fg(Color::LightGreen) /* NOP sled */
+                    Style::default().fg(to_color(state.theme.palette.entropy_low)) /* NOP sled */
                 } else {
-                    Style::default().fg(Color::White)
+                    Style::default().fg(to_color(state.theme.palette.hex_printable))
                 };
 
-                spans.push(Span::styled(format!("{:02x} ", b), style));
+                spans.push(Span::styled(crate::arch::HEX_TABLE[b as usize], style));
 
                 if (0x20..=0x7e).contains(&b) {
                     ascii_chars.push(b as char);
@@ -947,14 +1066,17 @@ fn render_hex_dump(frame: &mut Frame, state: &AppState, area: Rect) {
         }
 
         spans.push(Span::raw(" "));
-        spans.push(Span::styled(ascii_chars, Style::default().fg(Color::Gray)));
+        spans.push(Span::styled(
+            ascii_chars,
+            Style::default().fg(to_color(state.theme.palette.hex_nonprintable)),
+        ));
         lines.push(Line::from(spans));
     }
 
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-/* render statusline at bottom */
+/* render statusline at bottom with active theme preset and background worker spinner */
 fn render_status_line(frame: &mut Frame, state: &AppState, area: Rect) {
     if state.mode == VimMode::Command {
         let cmd_line = Line::from(vec![
@@ -990,14 +1112,28 @@ fn render_status_line(frame: &mut Frame, state: &AppState, area: Rect) {
 
     let status_color = if state.is_error_message { Color::Red } else { Color::Green };
 
+    let spinner_span = if let Some(ref task) = state.bg_task_status {
+        const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let frame_char = SPINNER_FRAMES[state.bg_task_spinner % SPINNER_FRAMES.len()];
+        Span::styled(
+            format!(" | {} {} ", frame_char, task),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::raw("")
+    };
+
     let status_line = Line::from(vec![
         Span::styled(format!(" {} ", state.mode.badge_name()), Style::default().fg(Color::Black).bg(mode_color).add_modifier(Modifier::BOLD)),
+        Span::raw(" "),
+        Span::styled(format!("[{}]", state.theme.preset.name()), Style::default().fg(to_color(state.theme.palette.border_active))),
         Span::raw(" "),
         Span::styled(filename, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
         Span::raw(" | "),
         Span::styled(format!("Off: 0x{:06x}", state.cursor_file_offset), Style::default().fg(Color::Cyan)),
         Span::raw(" | "),
         Span::styled(format!("VA: 0x{:08x}", state.cursor_va), Style::default().fg(Color::LightGreen)),
+        spinner_span,
         Span::raw(" | "),
         Span::styled(&state.status_message, Style::default().fg(status_color)),
     ]);
@@ -1010,8 +1146,7 @@ fn render_xref_modal(frame: &mut Frame, state: &AppState, target_va: u64, area: 
     let modal_area = centered_rect(65, 60, area);
     frame.render_widget(Clear, modal_area);
 
-    let xref_map = crate::xref::XrefMap::build_from_elf(&state.elf);
-    let items = xref_map.get_xrefs(target_va);
+    let items = state.cached_xref_map.as_ref().and_then(|m| m.get_xrefs(target_va));
 
     let list_items: Vec<ListItem> = match items {
         Some(list) => list

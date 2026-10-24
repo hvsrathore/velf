@@ -2,7 +2,7 @@
 
 use anyhow::{anyhow, Result};
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -10,6 +10,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use std::env;
 use std::io::stdout;
 use std::path::PathBuf;
+use std::time::Duration;
 use velf::{
     arch, audit, callgraph, cfg, codecave, debug, diff,
     elf::{self, format_p_flags, format_sh_flags, ElfBinary},
@@ -102,47 +103,92 @@ MODES & KEYBINDINGS:
     );
 }
 
-/* primary application event loop */
+/* primary application event loop decoupled at ~60 FPS with batched keystrokes */
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     state: &mut AppState,
 ) -> Result<()> {
-    loop {
-        terminal.draw(|f| ui::render_ui(f, state))?;
+    let frame_budget = Duration::from_millis(16); /* ~60 FPS rendering cap */
+    let mut last_render = std::time::Instant::now();
+    let mut dirty = true;
 
-        if let Event::Key(key) = event::read()? {
-            /* dispatch key event according to active Vim mode */
-            match state.mode {
-                VimMode::Normal => {
-                    if handle_normal_mode(state, key.code, key.modifiers)? {
-                        break; /* quit application */
+    loop {
+        /* increment background spinner frame if a task is running */
+        if state.bg_task_status.is_some() {
+            state.bg_task_spinner = state.bg_task_spinner.wrapping_add(1);
+            dirty = true;
+        }
+
+        /* only trigger ratatui redraw pass if state is dirty or frame budget elapsed */
+        if dirty || last_render.elapsed() >= frame_budget {
+            terminal.draw(|f| ui::render_ui(f, state))?;
+            last_render = std::time::Instant::now();
+            dirty = false;
+        }
+
+        /* compute remaining time slice before next frame */
+        let elapsed = last_render.elapsed();
+        let timeout = frame_budget.saturating_sub(elapsed);
+
+        if event::poll(timeout)? {
+            let mut key_batch = Vec::new();
+
+            /* batch rapid keystrokes before triggering redraw pass */
+            while event::poll(Duration::from_millis(0))? {
+                match event::read()? {
+                    Event::Key(key) => {
+                        if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat {
+                            key_batch.push(key);
+                        }
                     }
-                }
-                VimMode::AsmPatch => {
-                    handle_asm_patch_mode(state, key.code)?;
-                }
-                VimMode::FieldEdit => {
-                    handle_field_edit_mode(state, key.code)?;
-                }
-                VimMode::StringEdit => {
-                    handle_string_edit_mode(state, key.code)?;
-                }
-                VimMode::HookEdit => {
-                    handle_hook_edit_mode(state, key.code)?;
-                }
-                VimMode::Command => {
-                    if handle_command_mode(state, key.code)? {
-                        break; /* :q command executed */
+                    Event::Resize(_, _) => {
+                        dirty = true;
                     }
+                    _ => {}
                 }
-                VimMode::Search => {
-                    handle_search_mode(state, key.code)?;
+            }
+
+            for key in key_batch {
+                let should_quit = dispatch_key_event(state, key.code, key.modifiers)?;
+                if should_quit {
+                    return Ok(());
                 }
+                dirty = true;
             }
         }
     }
+}
 
-    Ok(())
+/* dispatch key event according to active Vim mode */
+fn dispatch_key_event(
+    state: &mut AppState,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+) -> Result<bool> {
+    match state.mode {
+        VimMode::Normal => handle_normal_mode(state, code, modifiers),
+        VimMode::AsmPatch => {
+            handle_asm_patch_mode(state, code)?;
+            Ok(false)
+        }
+        VimMode::FieldEdit => {
+            handle_field_edit_mode(state, code)?;
+            Ok(false)
+        }
+        VimMode::StringEdit => {
+            handle_string_edit_mode(state, code)?;
+            Ok(false)
+        }
+        VimMode::HookEdit => {
+            handle_hook_edit_mode(state, code)?;
+            Ok(false)
+        }
+        VimMode::Command => handle_command_mode(state, code),
+        VimMode::Search => {
+            handle_search_mode(state, code)?;
+            Ok(false)
+        }
+    }
 }
 
 /* handle key inputs in NORMAL mode */
@@ -191,6 +237,118 @@ fn handle_normal_mode(
         }
     }
 
+    /* check pending non-blocking chord */
+    if let Some(chord) = state.pending_chord.take() {
+        match chord {
+            'g' => match code {
+                KeyCode::Char('d') => {
+                    handle_go_to_definition(state)?;
+                    return Ok(false);
+                }
+                KeyCode::Char('f') => {
+                    toggle_cfg_view(state);
+                    return Ok(false);
+                }
+                KeyCode::Char('r') => {
+                    open_xref_modal_at_cursor(state);
+                    return Ok(false);
+                }
+                KeyCode::Char('s') => {
+                    open_symbol_search_modal(state);
+                    return Ok(false);
+                }
+                KeyCode::Char('a') => {
+                    open_audit_dashboard(state);
+                    return Ok(false);
+                }
+                KeyCode::Char('m') => {
+                    switch_to_memmap_view(state);
+                    return Ok(false);
+                }
+                KeyCode::Char('c') => {
+                    switch_to_callgraph_view(state);
+                    return Ok(false);
+                }
+                KeyCode::Char('p') => {
+                    switch_to_live_debug_view(state);
+                    return Ok(false);
+                }
+                KeyCode::Char('t') => {
+                    state.theme = state.theme.cycle_next();
+                    state.set_status(&format!("Theme: {}", state.theme.preset.name()), false);
+                    return Ok(false);
+                }
+                KeyCode::Char('g') => {
+                    state.center_cursor_index = 0;
+                    state.center_scroll_offset = 0;
+                    state.cursor_file_offset = 0;
+                    state.cursor_va = state.elf.offset_to_va(0).unwrap_or(0);
+                    state.update_disassembly_cache();
+                    state.sync_hex_scroll();
+                    state.set_status("Top of file", false);
+                    return Ok(false);
+                }
+                _ => {}
+            },
+            'c' => match code {
+                KeyCode::Char('c') => {
+                    handle_edit_trigger(state)?;
+                    return Ok(false);
+                }
+                KeyCode::Char('i') => {
+                    state.pending_chord = Some('i');
+                    state.set_status("ci...", false);
+                    return Ok(false);
+                }
+                _ => {}
+            },
+            'i' => match code {
+                KeyCode::Char('w') => {
+                    handle_edit_trigger(state)?;
+                    return Ok(false);
+                }
+                _ => {}
+            },
+            ']' => match code {
+                KeyCode::Char('c') => {
+                    let chunk_info = if let Some(ref mut d) = state.diff {
+                        let total = d.chunks.len();
+                        d.next_chunk().map(|c| (c.offset_a, c.chunk_index + 1, total))
+                    } else {
+                        None
+                    };
+                    if let Some((offset_a, cur, total)) = chunk_info {
+                        state.cursor_file_offset = offset_a;
+                        state.sync_hex_scroll();
+                        state.update_disassembly_cache();
+                        state.set_status(&format!("Diff chunk {}/{}", cur, total), false);
+                    }
+                    return Ok(false);
+                }
+                _ => {}
+            },
+            '[' => match code {
+                KeyCode::Char('c') => {
+                    let chunk_info = if let Some(ref mut d) = state.diff {
+                        let total = d.chunks.len();
+                        d.prev_chunk().map(|c| (c.offset_a, c.chunk_index + 1, total))
+                    } else {
+                        None
+                    };
+                    if let Some((offset_a, cur, total)) = chunk_info {
+                        state.cursor_file_offset = offset_a;
+                        state.sync_hex_scroll();
+                        state.update_disassembly_cache();
+                        state.set_status(&format!("Diff chunk {}/{}", cur, total), false);
+                    }
+                    return Ok(false);
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
     /* handle control key combinations */
     if modifiers.contains(KeyModifiers::CONTROL) {
         match code {
@@ -199,6 +357,7 @@ fn handle_normal_mode(
                 if let Some((off, va)) = state.jump_stack.pop_back((state.cursor_file_offset, state.cursor_va)) {
                     state.cursor_file_offset = off;
                     state.cursor_va = va;
+                    state.update_disassembly_cache();
                     state.sync_hex_scroll();
                     state.set_status(&format!("Jumped back to 0x{:08x}", va), false);
                 } else {
@@ -211,6 +370,7 @@ fn handle_normal_mode(
                 if let Some((off, va)) = state.jump_stack.pop_forward((state.cursor_file_offset, state.cursor_va)) {
                     state.cursor_file_offset = off;
                     state.cursor_va = va;
+                    state.update_disassembly_cache();
                     state.sync_hex_scroll();
                     state.set_status(&format!("Jumped forward to 0x{:08x}", va), false);
                 } else {
@@ -224,6 +384,7 @@ fn handle_normal_mode(
                     Ok(Some(off)) => {
                         state.cursor_file_offset = off;
                         state.cursor_va = state.elf.offset_to_va(off).unwrap_or(0);
+                        state.update_disassembly_cache();
                         state.sync_hex_scroll();
                         state.set_status("Redo: reapplied patch", false);
                     }
@@ -284,6 +445,7 @@ fn handle_normal_mode(
                 Ok(Some(off)) => {
                     state.cursor_file_offset = off;
                     state.cursor_va = state.elf.offset_to_va(off).unwrap_or(0);
+                    state.update_disassembly_cache();
                     state.sync_hex_scroll();
                     state.set_status("Undo: reverted patch", false);
                 }
@@ -308,6 +470,7 @@ fn handle_normal_mode(
             } else {
                 state.cursor_file_offset = state.cursor_file_offset.saturating_sub(1);
                 state.cursor_va = state.elf.offset_to_va(state.cursor_file_offset).unwrap_or(state.cursor_va);
+                state.update_disassembly_cache();
                 state.sync_hex_scroll();
             }
         }
@@ -319,6 +482,7 @@ fn handle_normal_mode(
             } else if state.cursor_file_offset + 1 < state.elf.bytes.len() {
                 state.cursor_file_offset += 1;
                 state.cursor_va = state.elf.offset_to_va(state.cursor_file_offset).unwrap_or(state.cursor_va);
+                state.update_disassembly_cache();
                 state.sync_hex_scroll();
             }
         }
@@ -329,42 +493,66 @@ fn handle_normal_mode(
             handle_up_navigation(state);
         }
         KeyCode::Char('w') => {
-            /* advance forward to next instruction, block, or field */
-            state.cursor_file_offset = (state.cursor_file_offset + 4).min(state.elf.bytes.len().saturating_sub(1));
-            state.cursor_va = state.elf.offset_to_va(state.cursor_file_offset).unwrap_or(state.cursor_va);
-            state.sync_hex_scroll();
+            /* advance forward to next instruction or 4 bytes in O(1) */
+            if state.center_view == CenterView::Disassembly {
+                let cur_off = state.cursor_file_offset;
+                let mut target_off = cur_off;
+                for _ in 0..4 {
+                    if let Some(next) = state.instruction_cache.next_offset(target_off) {
+                        target_off = next;
+                    } else {
+                        target_off += 4;
+                        break;
+                    }
+                }
+                state.cursor_file_offset = target_off.min(state.elf.bytes.len().saturating_sub(1));
+                state.cursor_va = state.elf.offset_to_va(state.cursor_file_offset).unwrap_or(state.cursor_va);
+                state.update_disassembly_cache();
+                state.sync_hex_scroll();
+            } else {
+                state.cursor_file_offset = (state.cursor_file_offset + 4).min(state.elf.bytes.len().saturating_sub(1));
+                state.cursor_va = state.elf.offset_to_va(state.cursor_file_offset).unwrap_or(state.cursor_va);
+                state.sync_hex_scroll();
+            }
         }
         KeyCode::Char('b') => {
-            /* regress backward to prior instruction, block, or field */
-            state.cursor_file_offset = state.cursor_file_offset.saturating_sub(4);
-            state.cursor_va = state.elf.offset_to_va(state.cursor_file_offset).unwrap_or(state.cursor_va);
-            state.sync_hex_scroll();
+            /* regress backward to prior instruction or 4 bytes in O(1) */
+            if state.center_view == CenterView::Disassembly {
+                let cur_off = state.cursor_file_offset;
+                let mut target_off = cur_off;
+                for _ in 0..4 {
+                    if let Some(prev) = state.instruction_cache.prev_offset(target_off) {
+                        target_off = prev;
+                    } else {
+                        target_off = target_off.saturating_sub(4);
+                        break;
+                    }
+                }
+                state.cursor_file_offset = target_off;
+                state.cursor_va = state.elf.offset_to_va(state.cursor_file_offset).unwrap_or(state.cursor_va);
+                state.update_disassembly_cache();
+                state.sync_hex_scroll();
+            } else {
+                state.cursor_file_offset = state.cursor_file_offset.saturating_sub(4);
+                state.cursor_va = state.elf.offset_to_va(state.cursor_file_offset).unwrap_or(state.cursor_va);
+                state.sync_hex_scroll();
+            }
         }
 
-        /* go to definition ('gd') */
+        /* non-blocking chord initiators */
         KeyCode::Char('g') => {
-            /* expect next character for two-key chords like 'gd', 'gf', 'gr', 'gs', 'ga', 'gm', 'gc', 'gp' */
-            if let Ok(Event::Key(next_key)) = event::read() {
-                match next_key.code {
-                    KeyCode::Char('d') => handle_go_to_definition(state)?,
-                    KeyCode::Char('f') => toggle_cfg_view(state),
-                    KeyCode::Char('r') => open_xref_modal_at_cursor(state),
-                    KeyCode::Char('s') => open_symbol_search_modal(state),
-                    KeyCode::Char('a') => open_audit_dashboard(state),
-                    KeyCode::Char('m') => switch_to_memmap_view(state),
-                    KeyCode::Char('c') => switch_to_callgraph_view(state),
-                    KeyCode::Char('p') => switch_to_live_debug_view(state),
-                    KeyCode::Char('g') => {
-                        /* jump to top */
-                        state.center_cursor_index = 0;
-                        state.center_scroll_offset = 0;
-                        state.cursor_file_offset = 0;
-                        state.cursor_va = state.elf.offset_to_va(0).unwrap_or(0);
-                        state.sync_hex_scroll();
-                    }
-                    _ => {}
-                }
-            }
+            state.pending_chord = Some('g');
+            state.set_status("g...", false);
+        }
+        KeyCode::Char('c') => {
+            state.pending_chord = Some('c');
+            state.set_status("c...", false);
+        }
+        KeyCode::Char(']') => {
+            state.pending_chord = Some(']');
+        }
+        KeyCode::Char('[') => {
+            state.pending_chord = Some('[');
         }
 
         KeyCode::Char('G') => {
@@ -372,52 +560,8 @@ fn handle_normal_mode(
             if !state.elf.bytes.is_empty() {
                 state.cursor_file_offset = state.elf.bytes.len().saturating_sub(1);
                 state.cursor_va = state.elf.offset_to_va(state.cursor_file_offset).unwrap_or(0);
+                state.update_disassembly_cache();
                 state.sync_hex_scroll();
-            }
-        }
-
-        /* edit modes: 'cc' or 'ciw' */
-        KeyCode::Char('c') => {
-            if let Ok(Event::Key(next_key)) = event::read() {
-                if next_key.code == KeyCode::Char('c') || next_key.code == KeyCode::Char('i') {
-                    handle_edit_trigger(state)?;
-                }
-            }
-        }
-
-        /* diff navigation: ']c' and '[c' */
-        KeyCode::Char(']') => {
-            if let Ok(Event::Key(next_key)) = event::read() {
-                if next_key.code == KeyCode::Char('c') {
-                    let chunk_info = if let Some(ref mut d) = state.diff {
-                        let total = d.chunks.len();
-                        d.next_chunk().map(|c| (c.offset_a, c.chunk_index + 1, total))
-                    } else {
-                        None
-                    };
-                    if let Some((offset_a, cur, total)) = chunk_info {
-                        state.cursor_file_offset = offset_a;
-                        state.sync_hex_scroll();
-                        state.set_status(&format!("Diff chunk {}/{}", cur, total), false);
-                    }
-                }
-            }
-        }
-        KeyCode::Char('[') => {
-            if let Ok(Event::Key(next_key)) = event::read() {
-                if next_key.code == KeyCode::Char('c') {
-                    let chunk_info = if let Some(ref mut d) = state.diff {
-                        let total = d.chunks.len();
-                        d.prev_chunk().map(|c| (c.offset_a, c.chunk_index + 1, total))
-                    } else {
-                        None
-                    };
-                    if let Some((offset_a, cur, total)) = chunk_info {
-                        state.cursor_file_offset = offset_a;
-                        state.sync_hex_scroll();
-                        state.set_status(&format!("Diff chunk {}/{}", cur, total), false);
-                    }
-                }
             }
         }
 
@@ -435,6 +579,7 @@ fn handle_down_navigation(state: &mut AppState) {
             let sec = &state.elf.sections[state.sidebar_index];
             state.cursor_file_offset = sec.sh_offset as usize;
             state.cursor_va = sec.sh_addr;
+            state.update_disassembly_cache();
             state.sync_hex_scroll();
         }
     } else if state.active_pane == 1 {
@@ -477,8 +622,28 @@ fn handle_down_navigation(state: &mut AppState) {
                     state.sync_hex_scroll();
                 }
             }
+            CenterView::Disassembly => {
+                /* step to next instruction in O(1) time using InstructionCache */
+                let cur_off = state.cursor_file_offset;
+                let next_off = if let Some(off) = state.instruction_cache.next_offset(cur_off) {
+                    off
+                } else {
+                    let cur_va = state.cursor_va;
+                    if let Some(instr) = state.instruction_cache.get_or_decode(&state.elf.bytes, cur_off, cur_va) {
+                        cur_off + instr.len
+                    } else {
+                        (cur_off + 4).min(state.elf.bytes.len().saturating_sub(1))
+                    }
+                };
+
+                if next_off < state.elf.bytes.len() {
+                    state.cursor_file_offset = next_off;
+                    state.cursor_va = state.elf.offset_to_va(next_off).unwrap_or(state.cursor_va + (next_off - cur_off) as u64);
+                    state.update_disassembly_cache();
+                    state.sync_hex_scroll();
+                }
+            }
             _ => {
-                /* step disassembly view forward by instruction or 16 bytes */
                 state.cursor_file_offset = (state.cursor_file_offset + 16).min(state.elf.bytes.len().saturating_sub(1));
                 state.cursor_va = state.elf.offset_to_va(state.cursor_file_offset).unwrap_or(state.cursor_va);
                 state.sync_hex_scroll();
@@ -488,6 +653,7 @@ fn handle_down_navigation(state: &mut AppState) {
         /* step hex pane 16 bytes forward */
         state.cursor_file_offset = (state.cursor_file_offset + 16).min(state.elf.bytes.len().saturating_sub(1));
         state.cursor_va = state.elf.offset_to_va(state.cursor_file_offset).unwrap_or(state.cursor_va);
+        state.update_disassembly_cache();
         state.sync_hex_scroll();
     }
 }
@@ -500,6 +666,7 @@ fn handle_up_navigation(state: &mut AppState) {
             let sec = &state.elf.sections[state.sidebar_index];
             state.cursor_file_offset = sec.sh_offset as usize;
             state.cursor_va = sec.sh_addr;
+            state.update_disassembly_cache();
             state.sync_hex_scroll();
         }
     } else if state.active_pane == 1 {
@@ -542,6 +709,20 @@ fn handle_up_navigation(state: &mut AppState) {
                     state.sync_hex_scroll();
                 }
             }
+            CenterView::Disassembly => {
+                /* step to previous instruction in O(1) time using InstructionCache */
+                let cur_off = state.cursor_file_offset;
+                let prev_off = if let Some(off) = state.instruction_cache.prev_offset(cur_off) {
+                    off
+                } else {
+                    cur_off.saturating_sub(4)
+                };
+
+                state.cursor_file_offset = prev_off;
+                state.cursor_va = state.elf.offset_to_va(prev_off).unwrap_or(0);
+                state.update_disassembly_cache();
+                state.sync_hex_scroll();
+            }
             _ => {
                 state.cursor_file_offset = state.cursor_file_offset.saturating_sub(16);
                 state.cursor_va = state.elf.offset_to_va(state.cursor_file_offset).unwrap_or(state.cursor_va);
@@ -551,6 +732,7 @@ fn handle_up_navigation(state: &mut AppState) {
     } else {
         state.cursor_file_offset = state.cursor_file_offset.saturating_sub(16);
         state.cursor_va = state.elf.offset_to_va(state.cursor_file_offset).unwrap_or(state.cursor_va);
+        state.update_disassembly_cache();
         state.sync_hex_scroll();
     }
 }
@@ -567,18 +749,11 @@ fn handle_go_to_definition(state: &mut AppState) -> Result<()> {
 
     match state.center_view {
         CenterView::Disassembly => {
-            let sec = state.elf.find_section_at_offset(state.cursor_file_offset);
-            if let Some(s) = sec {
-                if s.is_executable {
-                    let slice = &state.elf.bytes[s.sh_offset as usize..(s.sh_offset + s.sh_size) as usize];
-                    let instructions = arch::disassemble_slice(slice, s.sh_addr, s.sh_offset as usize);
-                    if let Some(target_instr) = instructions.iter().find(|i| i.file_offset == state.cursor_file_offset) {
-                        if let Some(t) = target_instr.near_branch_target() {
-                            resolved_va = Some(t);
-                        } else if target_instr.is_ip_rel_memory() {
-                            resolved_va = target_instr.ip_rel_memory_address();
-                        }
-                    }
+            if let Some(target_instr) = state.cached_disasm.iter().find(|i| i.file_offset <= state.cursor_file_offset && state.cursor_file_offset < i.file_offset + i.len) {
+                if let Some(t) = target_instr.near_branch_target() {
+                    resolved_va = Some(t);
+                } else if target_instr.is_ip_rel_memory() {
+                    resolved_va = target_instr.ip_rel_memory_address();
                 }
             }
         }
@@ -600,6 +775,7 @@ fn handle_go_to_definition(state: &mut AppState) -> Result<()> {
             state.jump_stack.push(state.cursor_file_offset, state.cursor_va);
             state.cursor_file_offset = off;
             state.cursor_va = va;
+            state.update_disassembly_cache();
             state.sync_hex_scroll();
             state.set_status(&format!("Jumped (gd) to 0x{:08x} (offset 0x{:04x})", va, off), false);
             return Ok(());
@@ -675,6 +851,7 @@ fn handle_asm_patch_mode(state: &mut AppState, code: KeyCode) -> Result<()> {
                     state.elf.bytes[state.cursor_file_offset..state.cursor_file_offset + orig_len].copy_from_slice(&new_bytes);
                     state.undo_stack.push_single(state.cursor_file_offset, old_bytes, new_bytes);
                     let _ = state.elf.reparse();
+                    state.update_disassembly_cache();
                     state.mode = VimMode::Normal;
                     state.set_status("Instruction patched with automatic NOP padding", false);
                 }
@@ -839,7 +1016,13 @@ fn handle_command_mode(state: &mut AppState, code: KeyCode) -> Result<bool> {
             } else if cmd == "cfg" {
                 toggle_cfg_view(state);
             } else if cmd == "strings" {
-                let xrefs = xref::XrefMap::build_from_elf(&state.elf);
+                let xrefs = if let Some(ref m) = state.cached_xref_map {
+                    m.clone()
+                } else {
+                    let m = xref::XrefMap::build_from_elf(&state.elf);
+                    state.cached_xref_map = Some(m.clone());
+                    m
+                };
                 state.strings_list = strings::scan_strings(&state.elf, &xrefs);
                 state.center_view = CenterView::Strings;
                 state.set_status(&format!("Loaded {} strings", state.strings_list.len()), false);
@@ -870,6 +1053,7 @@ fn handle_command_mode(state: &mut AppState, code: KeyCode) -> Result<bool> {
                         state.jump_stack.push(state.cursor_file_offset, state.cursor_va);
                         state.cursor_file_offset = off;
                         state.cursor_va = va;
+                        state.update_disassembly_cache();
                         state.sync_hex_scroll();
                         state.set_status(&format!("Jumped to symbol '{}' @ 0x{:08x}", name, va), false);
                     }
@@ -883,6 +1067,7 @@ fn handle_command_mode(state: &mut AppState, code: KeyCode) -> Result<bool> {
                     state.jump_stack.push(state.cursor_file_offset, state.cursor_va);
                     state.cursor_file_offset = off;
                     state.cursor_va = va;
+                    state.update_disassembly_cache();
                     state.sync_hex_scroll();
                     state.set_status(&format!("Jumped to section '{}'", name), false);
                 } else {
@@ -911,6 +1096,24 @@ fn handle_command_mode(state: &mut AppState, code: KeyCode) -> Result<bool> {
                     }
                     Err(e) => state.set_status(&format!("Diff failed: {}", e), true),
                 }
+            } else if let Some(theme_arg) = cmd.strip_prefix("theme ") {
+                if let Some(th) = velf::theme::Theme::from_preset_name(theme_arg.trim()) {
+                    state.theme = th;
+                    state.set_status(&format!("Theme set to {}", state.theme.preset.name()), false);
+                } else {
+                    state.set_status(&format!("Unknown theme preset '{}'", theme_arg), true);
+                }
+            } else if cmd == "rop" {
+                state.bg_task_status = Some("Scanning ROP gadgets in parallel...".to_string());
+                let gadgets = velf::rop::scan_rop_gadgets_parallel(&state.elf);
+                state.bg_task_status = None;
+                state.set_status(&format!("Found {} ROP gadgets across executable sections", gadgets.len()), false);
+            } else if cmd == "entropy" {
+                state.bg_task_status = Some("Calculating parallel Shannon entropy...".to_string());
+                let analysis = velf::entropy::EntropyAnalysis::compute_parallel(&state.elf.bytes, Some(state.elf.entry));
+                state.bg_task_status = None;
+                switch_to_memmap_view(state);
+                state.set_status(&format!("Shannon Entropy: mean {:.2}, min {:.2}, max {:.2}", analysis.mean_entropy, analysis.min_entropy, analysis.max_entropy), false);
             } else {
                 state.set_status(&format!("Unknown command: ':{}'", cmd), true);
             }
@@ -947,22 +1150,31 @@ fn handle_search_mode(state: &mut AppState, code: KeyCode) -> Result<()> {
 
 /* handle Enter confirmation in active modal overlay */
 fn handle_modal_confirm(state: &mut AppState) {
-    match &state.modal {
+    let current_modal = state.modal.clone();
+    match current_modal {
         ActiveModal::Xref(va) => {
-            let xref_map = xref::XrefMap::build_from_elf(&state.elf);
-            if let Some(list) = xref_map.get_xrefs(*va) {
-                if let Some(entry) = list.get(state.modal_cursor) {
-                    state.jump_stack.push(state.cursor_file_offset, state.cursor_va);
-                    state.cursor_file_offset = entry.source_file_offset;
-                    state.cursor_va = entry.source_va;
-                    state.sync_hex_scroll();
-                    state.modal = ActiveModal::None;
-                    state.set_status(&format!("Jumped to caller @ 0x{:08x}", entry.source_va), false);
-                }
+            let target = state
+                .cached_xref_map
+                .as_ref()
+                .and_then(|m| m.get_xrefs(va))
+                .and_then(|list| list.get(state.modal_cursor).cloned());
+            if let Some(entry) = target {
+                state.jump_stack.push(state.cursor_file_offset, state.cursor_va);
+                state.cursor_file_offset = entry.source_file_offset;
+                state.cursor_va = entry.source_va;
+                state.update_disassembly_cache();
+                state.sync_hex_scroll();
+                state.modal = ActiveModal::None;
+                state.set_status(&format!("Jumped to caller @ 0x{:08x}", entry.source_va), false);
             }
         }
         ActiveModal::Audit => {
-            if let Some(item) = state.security_report.items.get(state.modal_cursor) {
+            let target = state
+                .security_report
+                .items
+                .get(state.modal_cursor)
+                .cloned();
+            if let Some(item) = target {
                 if let Some(off) = item.target_file_offset {
                     state.cursor_file_offset = off;
                     state.center_view = CenterView::Headers;
@@ -976,6 +1188,7 @@ fn handle_modal_confirm(state: &mut AppState) {
                 state.jump_stack.push(state.cursor_file_offset, state.cursor_va);
                 state.cursor_file_offset = sym.file_offset;
                 state.cursor_va = sym.va;
+                state.update_disassembly_cache();
                 state.sync_hex_scroll();
                 state.modal = ActiveModal::None;
                 state.set_status(&format!("Jumped to symbol '{}' @ 0x{:08x}", sym.name, sym.va), false);
@@ -1025,6 +1238,9 @@ fn toggle_cfg_view(state: &mut AppState) {
 
 /* open incoming XREF modal */
 fn open_xref_modal_at_cursor(state: &mut AppState) {
+    if state.cached_xref_map.is_none() {
+        state.cached_xref_map = Some(xref::XrefMap::build_from_elf(&state.elf));
+    }
     state.modal = ActiveModal::Xref(state.cursor_va);
     state.modal_cursor = 0;
 }

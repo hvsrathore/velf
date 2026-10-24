@@ -5,10 +5,12 @@
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Target](https://img.shields.io/badge/Target-Linux%20ELF64%20(x86__64)-red.svg)]()
 [![TUI](https://img.shields.io/badge/Interface-Ratatui%20%2B%20Crossterm-brightgreen.svg)]()
+[![Multi-Core](https://img.shields.io/badge/Parallel-Rayon%20Multi--Core-purple.svg)]()
+[![Performance](https://img.shields.io/badge/Event%20Loop-60%20FPS%20Decoupled-cyan.svg)]()
 
-`velf` is a high-performance, keyboard-driven terminal application that brings **modal Vim editing conventions** to **ELF binary reverse-engineering, structural inspection, and live machine code patching**. 
+`velf` is an ultra-fast, keyboard-driven terminal reverse-engineering environment that pairs **Vim modal navigation** with **low-level ELF binary inspection, multi-core parallel binary analysis, and live in-memory patching**.
 
-Built from the ground up in Rust with `goblin`, `ratatui`, `iced-x86`, `petgraph`, `gimli`, and `nix`, `velf` bridges the gap between static disassemblers (IDA, Ghidra, radare2), structural hex editors, and interactive debuggers (GDB).
+Engineered in Rust with `goblin`, `ratatui`, `iced-x86`, `petgraph`, `rayon`, `gimli`, and `nix`, `velf` combines static disassemblers (IDA, Ghidra, radare2), structural hex editors, and interactive debuggers (GDB) into a single cohesive, sub-millisecond responsive TUI application.
 
 ```
 ┌── Sections (SHF_EXECINSTR) ─┐┌── [2] Disassembly (x86_64 Intel) ───────────────┐┌── [3] Hex / ASCII Dump ──────┐
@@ -17,7 +19,7 @@ Built from the ground up in Rust with `goblin`, `ratatui`, `iced-x86`, `petgraph
 │ 13 [X] .text      0x00401060 ││ 0x00401129  48 83 c4 08        add     rsp, 0x8 ││ 001130  0f 1f 84 00 00 00 00 00  ........ │
 │ 14     .rodata    0x00402000 ││ 0x0040112d  c3                 ret              ││ 001138  f3 0f 1e fa 48 83 ec 08  ....H... │
 └──────────────────────────────┘└────────────────────────────────────────────────┘└───────────────────────────────┘
--- NORMAL -- velf | Off: 0x001124 | VA: 0x00401124 | Press '?' for help, ':' for command mode
+-- NORMAL -- [Nord] ls | Off: 0x001124 | VA: 0x00401124 | Press '?' for help, ':' for command mode
 ```
 
 ---
@@ -35,6 +37,11 @@ Built from the ground up in Rust with `goblin`, `ratatui`, `iced-x86`, `petgraph
    - [Control-Flow Graph (CFG) Construction](#5-control-flow-graph-cfg-construction)
    - [Shannon Entropy & Memory Layout Timeline](#6-shannon-entropy--memory-layout-timeline)
    - [Binary Security Hardening Auditing](#7-binary-security-hardening-auditing)
+   - [Viewport Virtualization & LRU Instruction Cache](#8-viewport-virtualization--lru-instruction-cache)
+   - [Multi-Core Parallel Binary Engines via Rayon](#9-multi-core-parallel-binary-engines-via-rayon)
+   - [Backward-Sliding ROP Gadget Scanner](#10-backward-sliding-rop-gadget-scanner)
+   - [Decoupled 60 FPS Event Loop & Keystroke Batching](#11-decoupled-60-fps-event-loop--keystroke-batching)
+   - [Customizable Color Theme Engine & TOML Schemas](#12-customizable-color-theme-engine--toml-schemas)
 6. [Compilation & Installation](#-compilation--installation)
 7. [Contributing & Code Style](#-contributing--code-style)
 
@@ -50,22 +57,23 @@ flowchart TD
     Loader --> Mapper[VA to File Offset Mapper]
     Loader --> StructTable[FieldDescriptor Table\nEhdr, Phdr, Shdr]
     
-    Loader --> Arch[iced-x86 Disassembler & Assembler\nsrc/arch.rs]
+    Loader --> Arch[iced-x86 Disassembler & LRU Cache\nsrc/arch.rs]
     Arch --> CFG[Two-Pass Basic Block Splitter & DiGraph\nsrc/cfg.rs]
-    Arch --> XREF[Cross-Reference Indexer\nsrc/xref.rs]
+    Arch --> XREF[Parallel Cross-Reference Indexer\nsrc/xref.rs]
     Arch --> CallGraph[Inter-Procedural Call Graph\nsrc/callgraph.rs]
+    Arch --> ROP[Parallel ROP Gadget Scanner\nsrc/rop.rs]
     
     Loader --> Strings[Strings Inspector & Null-Safety\nsrc/strings.rs]
     Loader --> Reloc[PLT/GOT Relocation Engine\nsrc/reloc.rs]
     Loader --> Caves[Code Cave Scanner & Trampolines\nsrc/codecave.rs]
-    Loader --> MemMap[Memory Map Timeline & Shannon Entropy\nsrc/memmap.rs]
+    Loader --> MemMap[Memory Map & Parallel Shannon Entropy\nsrc/memmap.rs, src/entropy.rs]
     Loader --> DWARF[DWARF Line Table State Machine\nsrc/dwarf.rs]
     Loader --> Audit[Security Hardening Mitigations\nsrc/audit.rs]
     
     Vim[Stateful Vim Modal FSM\nsrc/vim.rs] --> JumpStack[JumpStack LIFO History\ngd, Ctrl-o, Ctrl-i]
     Vim --> UndoStack[Atomic & Composite Undo/Redo\nu, Ctrl-r]
     
-    Loader --> TUI[Ratatui 3-Pane TUI Engine\nsrc/ui.rs]
+    ThemeEngine[Color Theme & Palette Engine\nsrc/theme.rs] --> TUI[Decoupled 60 FPS Ratatui Engine\nsrc/ui.rs]
     Vim --> TUI
     Arch --> TUI
     CFG --> TUI
@@ -74,11 +82,14 @@ flowchart TD
 | Module | Purpose | Key Technologies |
 | :--- | :--- | :--- |
 | [`src/elf.rs`](file:///home/hvsr/dev/projects/rs/velf/src/elf.rs) | ELF Header, Segment, Section, and Symbol Table parser; physical offset mapper. | `goblin::elf` |
-| [`src/arch.rs`](file:///home/hvsr/dev/projects/rs/velf/src/arch.rs) | Intel-syntax x86_64 disassembler, instruction parser, in-place NOP-sled safety. | `iced-x86` |
+| [`src/arch.rs`](file:///home/hvsr/dev/projects/rs/velf/src/arch.rs) | Intel-syntax x86_64 disassembler, LRU instruction cache, and in-place NOP-sled safety. | `iced-x86` |
+| [`src/theme.rs`](file:///home/hvsr/dev/projects/rs/velf/src/theme.rs) | Preset palettes (Nord, Dracula, Monokai, Gruvbox, Solarized) & TOML loader. | `serde`, `toml` |
+| [`src/entropy.rs`](file:///home/hvsr/dev/projects/rs/velf/src/entropy.rs) | Multi-core 256-byte sliding window Shannon entropy analysis engine. | `rayon::par_chunks` |
+| [`src/rop.rs`](file:///home/hvsr/dev/projects/rs/velf/src/rop.rs) | Multi-threaded backward-sliding Return-Oriented Programming (ROP) gadget scanner. | `rayon::par_iter` |
 | [`src/cfg.rs`](file:///home/hvsr/dev/projects/rs/velf/src/cfg.rs) | Two-pass basic-block control flow graph builder and 2D box layout renderer. | `petgraph::graph::DiGraph` |
-| [`src/xref.rs`](file:///home/hvsr/dev/projects/rs/velf/src/xref.rs) | Branch and RIP-relative memory cross-reference indexing engine. | `iced-x86` |
+| [`src/xref.rs`](file:///home/hvsr/dev/projects/rs/velf/src/xref.rs) | Multi-core parallel branch and RIP-relative memory cross-reference indexer. | `rayon`, `iced-x86` |
 | [`src/strings.rs`](file:///home/hvsr/dev/projects/rs/velf/src/strings.rs) | String literal scanner, escape parser, and in-place null-termination safety engine. | `std::str` |
-| [`src/memmap.rs`](file:///home/hvsr/dev/projects/rs/velf/src/memmap.rs) | Segment-to-section memory map timeline, padding hole detector, and Shannon entropy analyzer. | Custom math |
+| [`src/memmap.rs`](file:///home/hvsr/dev/projects/rs/velf/src/memmap.rs) | Segment-to-section memory map timeline and inter-section padding detector. | Systems math |
 | [`src/reloc.rs`](file:///home/hvsr/dev/projects/rs/velf/src/reloc.rs) | Dynamic `.rela.plt` and `.rela.dyn` relocation parser and live GOT slot hook redirector. | `goblin` |
 | [`src/codecave.rs`](file:///home/hvsr/dev/projects/rs/velf/src/codecave.rs) | Contiguous filler byte (`0x00`/`0x90`) scanner and automated 5-byte JMP trampoline deployer. | `iced-x86` |
 | [`src/dwarf.rs`](file:///home/hvsr/dev/projects/rs/velf/src/dwarf.rs) | DWARF compilation unit line-program state machine evaluator for source-code correlation. | `gimli`, `object` |
@@ -89,22 +100,24 @@ flowchart TD
 | [`src/diff.rs`](file:///home/hvsr/dev/projects/rs/velf/src/diff.rs) | Side-by-side binary hex diffing engine with sliding window discrepancy chunking. | Sliding window |
 | [`src/callgraph.rs`](file:///home/hvsr/dev/projects/rs/velf/src/callgraph.rs) | Global inter-procedural function call graph visualizer. | `petgraph` |
 | [`src/vim.rs`](file:///home/hvsr/dev/projects/rs/velf/src/vim.rs) | Stateful Vim modal FSM, JumpStack, and atomic/composite Undo/Redo stack. | FSM |
-| [`src/ui.rs`](file:///home/hvsr/dev/projects/rs/velf/src/ui.rs) | Ratatui rendering engine: 3-pane layout, synchronized hex dump, and floating modals. | `ratatui`, `crossterm` |
+| [`src/ui.rs`](file:///home/hvsr/dev/projects/rs/velf/src/ui.rs) | Virtualized viewport renderer, synchronized hex dump, and theme styler. | `ratatui`, `crossterm` |
 
 ---
 
 ## 🚀 Key Features
 
-* **Synchronized 3-Pane Interface**: Left sidebar displays ELF sections and `STT_FUNC` symbols; Center pane switches dynamically between Disassembly, CFG, Headers, Strings, Relocations, Memory Map, Diff, and Call Graph; Right pane renders a byte-synchronized Hex and ASCII dump.
-* **Inline Machine Code Patching (`ASM_PATCH`)**: Press `cc` on any disassembled instruction to type Intel-syntax assembly (`nop`, `ret`, `int3`, `mov`, `xor`, `add`, `sub`, `cmp`, `call`, `jmp`, `je`, `jne`).
+* **Instantaneous Keystroke Response ($O(1)$ Navigation)**: Decoupled event loop with non-blocking key burst draining and an LRU `InstructionCache` that eliminates all input latency during rapid navigation.
+* **Viewport Virtualization**: Disassembly and Hex editors only decode, format, and render the exact lines visible in the active terminal window (e.g., 40 rows), completely bypassing full-section re-decoding.
+* **Rayon Multi-Core Parallel Analysis**: Heavy static analysis tasks—including section-wide XREF indexing, 256-byte Shannon entropy calculations, and backward-sliding ROP gadget finding—are partitioned across CPU cores in parallel with real-time UI spinner feedback.
+* **Customizable Color Theme Engine**: Full support for Nord, Dracula, Monokai, Gruvbox, and Solarized Dark palettes, with instant runtime cycling via `gt` or `:theme <preset>`, alongside user-defined TOML configurations at `~/.config/velf/theme.toml`.
+* **Token-Level Disassembly Syntax Highlighting**: Custom `iced_x86::FormatterOutput` highlights mnemonics (CALL, JMP, RET), registers (RAX, RSP), numeric immediates, memory dereference brackets (`[` `]`), and branch targets.
+* **Inline Machine Code Patching (`ASM_PATCH`)**: Press `cc` on any disassembled instruction to enter Intel-syntax assembly (`nop`, `ret`, `int3`, `mov`, `xor`, `add`, `sub`, `cmp`, `call`, `jmp`).
 * **Strict In-Place Binary Safety**: If newly encoded machine code exceeds original instruction byte length, edits are rejected to prevent corrupting adjacent instructions. If shorter, remaining bytes are automatically padded with `0x90` (`NOP`).
 * **Automated Code Cave Trampolines**: When a patch exceeds the original instruction size, automatically deploy an unconditional 5-byte `JMP rel32` into an available code cave, execute the multi-instruction payload, and return to `next_ip`.
 * **Interactive 2D Control-Flow Graph (CFG)**: Toggle between linear disassembly and a 2D hierarchical ASCII/Unicode box-drawing CFG with `gf` or `:cfg`. Edges are color-coded: **Green** for `BranchTaken`, **Red** for `Fallthrough`, and **Cyan** for `Unconditional`.
 * **Jump-Stack Navigation (`gd` / `Ctrl-o` / `Ctrl-i`)**: Press `gd` on any branch, call, symbol, or relocation to resolve the target address, push the origin to the `JumpStack`, and jump instantly to the target file offset. Navigate backward with `Ctrl-o` and forward with `Ctrl-i`.
 * **Comprehensive Undo/Redo History Tree (`u` / `Ctrl-r`)**: Every machine code patch, header modification, string edit, and trampoline is recorded on an atomic `UndoStack`.
-* **Structural Header Editor (`Elf64_Ehdr`, `Elf64_Phdr`, `Elf64_Shdr`)**: Inspect and edit every struct member with endianness awareness. Supports raw hexadecimal/decimal values, symbolic bitflag expressions (`PF_R | PF_W | PF_X`, `rwx`, `SHF_ALLOC | SHF_EXECINSTR`), and quick bit-toggling via `Ctrl-a` / `Ctrl-x`.
 * **Live Process Attachment (`ptrace`)**: Attach directly to running processes with `:attach <pid>`, read live virtual memory, manage `INT 3` software breakpoints, inspect CPU registers (`RAX`, `RBX`, `RIP`, `RFLAGS`), single-step (`s`), and patch code in memory.
-* **Side-by-Side Hex Diff (`:diff <file>`)**: Align two binaries or memory snapshots and jump across differences using `]c` and `[c`.
 
 ---
 
@@ -113,10 +126,11 @@ flowchart TD
 ### NORMAL Mode Motions & Navigation
 | Key | Action |
 | :--- | :--- |
-| `h` / `j` / `k` / `l` | Navigate cursor left, down, up, and right across the active pane. |
-| `w` / `b` | Advance forward / backward by instruction, basic-block node, or table entry. |
+| `h` / `j` / `k` / `l` | Navigate cursor left, down, up, and right across the active pane ($O(1)$ instruction stepping). |
+| `w` / `b` | Advance forward / backward by 4 instructions or basic-block nodes. |
 | `gg` / `G` | Jump to the very top / very bottom of the active view. |
 | `Tab` / `BackTab` | Cycle focus across **[1] Sidebar**, **[2] Center Pane**, and **[3] Hex Dump**. |
+| `gt` | **Cycle Theme**: Instantly cycle through built-in palettes (Nord $\to$ Dracula $\to$ Monokai $\to$ Gruvbox $\to$ Solarized). |
 | `gd` | **Go to Definition**: Resolves branch/call targets, symbols, PLT thunks, or strings under cursor. |
 | `Ctrl-o` | Jump backward to previous location along the `JumpStack`. |
 | `Ctrl-i` | Navigate forward along the `JumpStack` history tree. |
@@ -144,6 +158,9 @@ flowchart TD
 | `gm` | `:map` | Switch to Visual Memory Map and Shannon entropy timeline. |
 | `gc` | `:callgraph` | Switch to Inter-Procedural Call Graph tree view. |
 | `gp` | `:attach <pid>` | Switch to Live Process Debugger (via `ptrace`). |
+| — | `:rop` | Execute multi-core parallel ROP gadget scanner. |
+| — | `:entropy` | Compute parallel Shannon entropy across 256-byte blocks. |
+| — | `:theme <preset>` | Load color theme (`nord`, `dracula`, `monokai`, `gruvbox`, `solarized`, `custom`). |
 | — | `:strings` | Switch to dedicated Strings Inspector view. |
 | — | `:plt` | Switch to Relocation Table Inspector view. |
 | — | `:caves` | Open Code Cave Inspector modal. |
@@ -160,6 +177,9 @@ Enter Command mode by pressing `:` in `NORMAL` mode:
 | :--- | :--- | :--- |
 | `:q` / `:quit` | — | Quit `velf`. |
 | `:w` / `:write` | `[filepath]` | Save modified ELF binary in-place or write to a new destination. |
+| `:theme <name>` | `<name>` | Set active theme palette (`nord`, `dracula`, `monokai`, `gruvbox`, `solarized`). |
+| `:rop` | — | Scan binary for Return-Oriented Programming gadgets in parallel. |
+| `:entropy` | — | Compute sliding-window Shannon entropy across all segments in parallel. |
 | `:sym <name>` | `<name>` | Search for symbol by exact name and jump directly to its Virtual Address. |
 | `:sec <name>` | `<name>` | Search for section by exact name (e.g. `:sec .text`, `:sec .rodata`) and jump. |
 | `:cfg` | — | Generate and render Control-Flow Graph for current function. |
@@ -193,13 +213,12 @@ ELF File on Disk:
 └─────────────────┴───────────────────────────────┴─────────────────┘
                           │ Kernel MMU Mapping
                           ▼
-Virtual Memory Space (Process Execution):
+Process Virtual Memory:
 ┌─────────────────────────────────┬─────────────────────────────────┐
-│ Virtual Address: 0x00401000     │ Virtual Address: 0x00403400     │
-│ Segment Start (p_vaddr)         │ Segment End (p_vaddr+p_memsz)   │
+│ Segment 0 (p_vaddr=0x401000)    │ Segment 1 (p_vaddr=0x404000)    │
+│ p_memsz=0x3000 (0x600 zero-fill)│ ...                             │
 └─────────────────────────────────┴─────────────────────────────────┘
 ```
-If a Virtual Address falls outside defined `PT_LOAD` segments, `velf` falls back to querying `SectionHeader` records (`sh_addr` and `sh_offset`).
 
 ### 2. In-Place Machine Code Patching & Safety
 When typing assembly in `ASM_PATCH` mode:
@@ -210,7 +229,7 @@ When typing assembly in `ASM_PATCH` mode:
 4. If shorter, the leftover space is padded with `0x90` (`NOP` sled).
 
 ### 3. Automated Code Cave Trampolines
-When a patch exceeds the original instruction size (e.g., trying to write a 12-byte payload into a 3-byte slot), an in-place patch would overwrite the start of the next instruction, crashing execution. 
+When a patch exceeds the original instruction size (e.g., trying to write a 12-byte payload into a 3-byte slot), an in-place patch would overwrite adjacent instructions, crashing execution. 
 
 `velf` solves this by deploying an automated **JMP Trampoline**:
 
@@ -265,6 +284,43 @@ $$H(X) = - \sum_{i=0}^{255} P(x_i) \log_2 P(x_i)$$
 3. **Stack Canaries**: Scans `.symtab` and `.dynsym` for imported compiler guards (`__stack_chk_fail`).
 4. **PIE (Position-Independent Executable)**: Checks `Elf64_Ehdr` `e_type == ET_DYN` for ASLR randomization.
 
+### 8. Viewport Virtualization & LRU Instruction Cache
+To eliminate rendering overhead on large binaries (hundreds of megabytes), `velf` uses **Viewport Virtualization** backed by an LRU `InstructionCache`:
+* **Zero Whole-Section Re-decodes**: Only instructions visible within the current terminal viewport height (e.g. 40 rows) are decoded and formatted.
+* **$O(1)$ Navigation**: The cache maintains a sorted index of known instruction offsets. Keystrokes like `j`, `k`, `w`, and `b` perform an $O(1)$ lookup in the offset index, avoiding byte scanning.
+* **Zero-Allocation Hex Tables**: All 2-digit byte hex strings are retrieved from static lookup arrays (`HEX_TABLE`), eliminating hundreds of string allocations per frame.
+
+### 9. Multi-Core Parallel Binary Engines via Rayon
+Heavy computational tasks are accelerated across all available CPU cores:
+* **Parallel XREF Map Generation**: Executable sections are partitioned and decoded concurrently using `rayon::par_iter()`, merging thread-local reference maps into a unified index.
+* **Parallel Shannon Entropy**: 256-byte blocks are computed concurrently via `rayon::par_chunks()`.
+* **Thread-Safe Work Aggregation**: Local analysis chunks are merged into synchronized indices using parallel fold/reduce patterns.
+
+### 10. Backward-Sliding ROP Gadget Scanner
+Return-Oriented Programming (ROP) gadgets are discovered by sliding backwards from control-flow transfer instructions:
+* Targets `0xC3` (`RET`), `0xC2` (`RET imm16`), and `0x0F 0x05` (`SYSCALL`).
+* Slides backward 1 to 16 bytes from each terminator offset.
+* Verifies linear validity: ensures candidate sequences decode without invalid opcodes and contain no mid-gadget branch instructions.
+* Partitions executable chunks across worker threads via Rayon, finding thousands of gadgets in milliseconds.
+
+### 11. Decoupled 60 FPS Event Loop & Keystroke Batching
+* Replaces blocking reads with `crossterm::event::poll(Duration::from_millis(16))`, capping rendering at ~60 FPS while consuming 0% CPU when idle.
+* Drains bursts of queued key-press events before triggering a redraw pass, ensuring rapid key-repeats never produce lag.
+
+### 12. Customizable Color Theme Engine & TOML Schemas
+Themes can be configured via `~/.config/velf/theme.toml`:
+```toml
+[palette]
+background = [40, 42, 54]
+foreground = [248, 248, 242]
+border = [98, 114, 164]
+border_active = [189, 147, 249]
+mnemonic = [255, 121, 198]
+mnemonic_call = [139, 233, 253]
+register = [255, 184, 108]
+immediate = [241, 250, 140]
+```
+
 ---
 
 ## 🛠 Compilation & Installation
@@ -283,7 +339,7 @@ cd velf
 # Build optimized release binary
 cargo build --release
 
-# Run test suite (15 unit and integration tests)
+# Run comprehensive test suite (22 unit & integration tests)
 cargo test
 
 # Launch velf on any ELF binary
@@ -297,7 +353,7 @@ cargo test
 To keep the codebase accessible to developers of all backgrounds, this repository adheres to strict style conventions specified in `AGENTS.md`:
 1. **Comment Style**: Block comments `/* ... */` only. No `//` or `///`.
 2. **Comment Casing**: Natural English comments must start with a lowercase letter (e.g. `/* parse symbol table */`).
-3. **Identifier Casing**: Preserve uppercase casing for protocol names, architectural terms, flags, and symbol names (e.g. `ELF`, `PLT`, `GOT`, `STT_FUNC`, `SHF_EXECINSTR`, `PT_LOAD`, `CALL`, `JMP`, `NOP`, `Intel`, `x86_64`).
+3. **Identifier Casing**: Preserve uppercase casing for protocol names, architectural terms, flags, and symbol names (e.g. `ELF`, `PLT`, `GOT`, `STT_FUNC`, `SHF_EXECINSTR`, `PT_LOAD`, `CALL`, `JMP`, `NOP`, `Intel`, `x86_64`, `ROP`, `LRU`).
 4. **Educational Value**: Include clear, low-level explanatory commentary for systems programming constructs.
 
 ---

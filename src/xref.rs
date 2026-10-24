@@ -3,6 +3,7 @@
 use crate::arch::disassemble_slice;
 use crate::elf::ElfBinary;
 use iced_x86::{Code, FlowControl, Formatter, IntelFormatter};
+use rayon::prelude::*;
 use std::collections::HashMap;
 
 /* classification of cross-reference relationship */
@@ -71,12 +72,21 @@ impl XrefMap {
             .unwrap_or(0)
     }
 
+    /* safely merge another XrefMap chunk into this index */
+    pub fn merge(&mut self, other: XrefMap) {
+        for (target_va, entries) in other.target_to_xrefs {
+            self.target_to_xrefs
+                .entry(target_va)
+                .or_default()
+                .extend(entries);
+        }
+    }
+
     /*
-     * index all executable sections (SHF_EXECINSTR) in the ELF binary.
+     * index all executable sections (SHF_EXECINSTR) in the ELF binary using Rayon par_iter().
      * Identifies branches, calls, RIP-relative memory loads, and PLT/GOT trampolines.
      */
     pub fn build_from_elf(elf: &ElfBinary) -> Self {
-        let mut map = Self::new();
         let functions = elf.find_function_symbols();
 
         /* helper to locate enclosing function name and relative offset for an address */
@@ -95,7 +105,6 @@ impl XrefMap {
         let mut got_to_dynsym_va = HashMap::new();
         for reloc in &elf.relocations {
             if reloc.is_plt {
-                /* target VA in .got.plt */
                 if let Some(ref sym_name) = reloc.sym_name {
                     if let Some(sym) = elf.find_symbol_by_name(sym_name) {
                         got_to_dynsym_va.insert(reloc.r_offset, sym.st_value);
@@ -104,122 +113,124 @@ impl XrefMap {
             }
         }
 
-        let mut formatter = IntelFormatter::new();
+        /* filter executable sections for multi-core parallel analysis */
+        let exec_sections: Vec<&crate::elf::SectionInfo> = elf
+            .sections
+            .iter()
+            .filter(|s| s.is_executable && s.sh_size > 0 && (s.sh_offset + s.sh_size) as usize <= elf.bytes.len())
+            .collect();
 
-        /* iterate through all executable sections */
-        for sec in &elf.sections {
-            if !sec.is_executable || sec.sh_size == 0 {
-                continue;
-            }
+        /* parallelize instruction decoding and XREF indexing across executable sections */
+        exec_sections
+            .par_iter()
+            .map(|sec| {
+                let mut local_map = XrefMap::new();
+                let mut formatter = IntelFormatter::new();
 
-            let start_off = sec.sh_offset as usize;
-            let end_off = (sec.sh_offset + sec.sh_size) as usize;
-            if end_off > elf.bytes.len() {
-                continue;
-            }
+                let start_off = sec.sh_offset as usize;
+                let end_off = (sec.sh_offset + sec.sh_size) as usize;
+                let sec_bytes = &elf.bytes[start_off..end_off];
+                let instructions = disassemble_slice(sec_bytes, sec.sh_addr, start_off);
 
-            let sec_bytes = &elf.bytes[start_off..end_off];
-            let instructions = disassemble_slice(sec_bytes, sec.sh_addr, start_off);
+                for dec_instr in instructions {
+                    let instr = &dec_instr.instruction;
+                    let ip = dec_instr.va;
+                    let (caller_name, caller_off) = find_enclosing_function(ip);
 
-            for dec_instr in instructions {
-                let instr = &dec_instr.instruction;
-                let ip = dec_instr.va;
-                let (caller_name, caller_off) = find_enclosing_function(ip);
+                    let mut disasm_buf = String::new();
+                    formatter.format(instr, &mut disasm_buf);
 
-                let mut disasm_buf = String::new();
-                formatter.format(instr, &mut disasm_buf);
-
-                /* (a) near branches and calls */
-                let flow = instr.flow_control();
-                match flow {
-                    FlowControl::Call => {
-                        let target = instr.near_branch_target();
-                        if target != 0 {
-                            map.add_xref(
-                                target,
-                                XrefEntry {
-                                    source_va: ip,
-                                    source_file_offset: dec_instr.file_offset,
-                                    target_va: target,
-                                    kind: XrefKind::Call,
-                                    caller_func: caller_name.clone(),
-                                    caller_offset: caller_off,
-                                    disasm: disasm_buf.clone(),
-                                },
-                            );
+                    /* (a) near branches and calls */
+                    let flow = instr.flow_control();
+                    match flow {
+                        FlowControl::Call => {
+                            let target = instr.near_branch_target();
+                            if target != 0 {
+                                local_map.add_xref(
+                                    target,
+                                    XrefEntry {
+                                        source_va: ip,
+                                        source_file_offset: dec_instr.file_offset,
+                                        target_va: target,
+                                        kind: XrefKind::Call,
+                                        caller_func: caller_name.clone(),
+                                        caller_offset: caller_off,
+                                        disasm: disasm_buf.clone(),
+                                    },
+                                );
+                            }
                         }
-                    }
-                    FlowControl::ConditionalBranch | FlowControl::UnconditionalBranch => {
-                        let target = instr.near_branch_target();
-                        if target != 0 {
-                            map.add_xref(
-                                target,
-                                XrefEntry {
-                                    source_va: ip,
-                                    source_file_offset: dec_instr.file_offset,
-                                    target_va: target,
-                                    kind: XrefKind::Jump,
-                                    caller_func: caller_name.clone(),
-                                    caller_offset: caller_off,
-                                    disasm: disasm_buf.clone(),
-                                },
-                            );
+                        FlowControl::ConditionalBranch | FlowControl::UnconditionalBranch => {
+                            let target = instr.near_branch_target();
+                            if target != 0 {
+                                local_map.add_xref(
+                                    target,
+                                    XrefEntry {
+                                        source_va: ip,
+                                        source_file_offset: dec_instr.file_offset,
+                                        target_va: target,
+                                        kind: XrefKind::Jump,
+                                        caller_func: caller_name.clone(),
+                                        caller_offset: caller_off,
+                                        disasm: disasm_buf.clone(),
+                                    },
+                                );
+                            }
                         }
+                        _ => {}
                     }
-                    _ => {}
-                }
 
-                /* (b) RIP-relative memory operands */
-                if instr.is_ip_rel_memory_operand() {
-                    let target_va = instr.ip_rel_memory_address();
+                    /* (b) RIP-relative memory operands */
+                    if instr.is_ip_rel_memory_operand() {
+                        let target_va = instr.ip_rel_memory_address();
+                        let code = instr.code();
+                        let kind = if code == Code::Lea_r64_m {
+                            XrefKind::AddressLoad
+                        } else if flow == FlowControl::IndirectCall {
+                            XrefKind::Call
+                        } else if flow == FlowControl::IndirectBranch {
+                            XrefKind::Jump
+                        } else {
+                            XrefKind::DataRead
+                        };
 
-                    /* classify based on opcode: LEA -> AddressLoad, else -> DataRead */
-                    let code = instr.code();
-                    let kind = if code == Code::Lea_r64_m {
-                        XrefKind::AddressLoad
-                    } else if flow == FlowControl::IndirectCall {
-                        XrefKind::Call
-                    } else if flow == FlowControl::IndirectBranch {
-                        XrefKind::Jump
-                    } else {
-                        XrefKind::DataRead
-                    };
-
-                    /* record XREF to memory address */
-                    map.add_xref(
-                        target_va,
-                        XrefEntry {
-                            source_va: ip,
-                            source_file_offset: dec_instr.file_offset,
+                        local_map.add_xref(
                             target_va,
-                            kind,
-                            caller_func: caller_name.clone(),
-                            caller_offset: caller_off,
-                            disasm: disasm_buf.clone(),
-                        },
-                    );
+                            XrefEntry {
+                                source_va: ip,
+                                source_file_offset: dec_instr.file_offset,
+                                target_va,
+                                kind,
+                                caller_func: caller_name.clone(),
+                                caller_offset: caller_off,
+                                disasm: disasm_buf.clone(),
+                            },
+                        );
 
-                    /* if accessing a .got.plt slot, also link to resolved dynamic symbol */
-                    if let Some(&sym_va) = got_to_dynsym_va.get(&target_va) {
-                        if sym_va != 0 {
-                            map.add_xref(
-                                sym_va,
-                                XrefEntry {
-                                    source_va: ip,
-                                    source_file_offset: dec_instr.file_offset,
-                                    target_va: sym_va,
-                                    kind: XrefKind::Call,
-                                    caller_func: caller_name.clone(),
-                                    caller_offset: caller_off,
-                                    disasm: disasm_buf.clone(),
-                                },
-                            );
+                        if let Some(&sym_va) = got_to_dynsym_va.get(&target_va) {
+                            if sym_va != 0 {
+                                local_map.add_xref(
+                                    sym_va,
+                                    XrefEntry {
+                                        source_va: ip,
+                                        source_file_offset: dec_instr.file_offset,
+                                        target_va: sym_va,
+                                        kind: XrefKind::Call,
+                                        caller_func: caller_name.clone(),
+                                        caller_offset: caller_off,
+                                        disasm: disasm_buf.clone(),
+                                    },
+                                );
+                            }
                         }
                     }
                 }
-            }
-        }
 
-        map
+                local_map
+            })
+            .reduce(XrefMap::new, |mut acc, local| {
+                acc.merge(local);
+                acc
+            })
     }
 }

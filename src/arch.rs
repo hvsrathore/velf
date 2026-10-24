@@ -3,8 +3,52 @@
 use anyhow::{anyhow, Result};
 use iced_x86::{
     BlockEncoder, BlockEncoderOptions, Code, Decoder, DecoderOptions, FlowControl, Formatter,
-    Instruction, InstructionBlock, IntelFormatter, MemoryOperand, Register,
+    FormatterOutput, FormatterTextKind, Instruction, InstructionBlock, IntelFormatter,
+    MemoryOperand, Register,
 };
+use ratatui::style::{Modifier, Style};
+use ratatui::text::Span;
+use std::collections::HashMap;
+
+/* precomputed static 2-hex-digit lookup table with trailing space to eliminate allocations */
+pub static HEX_TABLE: [&str; 256] = [
+    "00 ", "01 ", "02 ", "03 ", "04 ", "05 ", "06 ", "07 ", "08 ", "09 ", "0a ", "0b ", "0c ", "0d ", "0e ", "0f ",
+    "10 ", "11 ", "12 ", "13 ", "14 ", "15 ", "16 ", "17 ", "18 ", "19 ", "1a ", "1b ", "1c ", "1d ", "1e ", "1f ",
+    "20 ", "21 ", "22 ", "23 ", "24 ", "25 ", "26 ", "27 ", "28 ", "29 ", "2a ", "2b ", "2c ", "2d ", "2e ", "2f ",
+    "30 ", "31 ", "32 ", "33 ", "34 ", "35 ", "36 ", "37 ", "38 ", "39 ", "3a ", "3b ", "3c ", "3d ", "3e ", "3f ",
+    "40 ", "41 ", "42 ", "43 ", "44 ", "45 ", "46 ", "47 ", "48 ", "49 ", "4a ", "4b ", "4c ", "4d ", "4e ", "4f ",
+    "50 ", "51 ", "52 ", "53 ", "54 ", "55 ", "56 ", "57 ", "58 ", "59 ", "5a ", "5b ", "5c ", "5d ", "5e ", "5f ",
+    "60 ", "61 ", "62 ", "63 ", "64 ", "65 ", "66 ", "67 ", "68 ", "69 ", "6a ", "6b ", "6c ", "6d ", "6e ", "6f ",
+    "70 ", "71 ", "72 ", "73 ", "74 ", "75 ", "76 ", "77 ", "78 ", "79 ", "7a ", "7b ", "7c ", "7d ", "7e ", "7f ",
+    "80 ", "81 ", "82 ", "83 ", "84 ", "85 ", "86 ", "87 ", "88 ", "89 ", "8a ", "8b ", "8c ", "8d ", "8e ", "8f ",
+    "90 ", "91 ", "92 ", "93 ", "94 ", "95 ", "96 ", "97 ", "98 ", "99 ", "9a ", "9b ", "9c ", "9d ", "9e ", "9f ",
+    "a0 ", "a1 ", "a2 ", "a3 ", "a4 ", "a5 ", "a6 ", "a7 ", "a8 ", "a9 ", "aa ", "ab ", "ac ", "ad ", "ae ", "af ",
+    "b0 ", "b1 ", "b2 ", "b3 ", "b4 ", "b5 ", "b6 ", "b7 ", "b8 ", "b9 ", "ba ", "bb ", "bc ", "bd ", "be ", "bf ",
+    "c0 ", "c1 ", "c2 ", "c3 ", "c4 ", "c5 ", "c6 ", "c7 ", "c8 ", "c9 ", "ca ", "cb ", "cc ", "cd ", "ce ", "cf ",
+    "d0 ", "d1 ", "d2 ", "d3 ", "d4 ", "d5 ", "d6 ", "d7 ", "d8 ", "d9 ", "da ", "db ", "dc ", "dd ", "de ", "df ",
+    "e0 ", "e1 ", "e2 ", "e3 ", "e4 ", "e5 ", "e6 ", "e7 ", "e8 ", "e9 ", "ea ", "eb ", "ec ", "ed ", "ee ", "ef ",
+    "f0 ", "f1 ", "f2 ", "f3 ", "f4 ", "f5 ", "f6 ", "f7 ", "f8 ", "f9 ", "fa ", "fb ", "fc ", "fd ", "fe ", "ff ",
+];
+
+/* precomputed static 2-hex-digit lookup table without trailing space */
+pub static HEX_BYTE: [&str; 256] = [
+    "00", "01", "02", "03", "04", "05", "06", "07", "08", "09", "0a", "0b", "0c", "0d", "0e", "0f",
+    "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "1a", "1b", "1c", "1d", "1e", "1f",
+    "20", "21", "22", "23", "24", "25", "26", "27", "28", "29", "2a", "2b", "2c", "2d", "2e", "2f",
+    "30", "31", "32", "33", "34", "35", "36", "37", "38", "39", "3a", "3b", "3c", "3d", "3e", "3f",
+    "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "4a", "4b", "4c", "4d", "4e", "4f",
+    "50", "51", "52", "53", "54", "55", "56", "57", "58", "59", "5a", "5b", "5c", "5d", "5e", "5f",
+    "60", "61", "62", "63", "64", "65", "66", "67", "68", "69", "6a", "6b", "6c", "6d", "6e", "6f",
+    "70", "71", "72", "73", "74", "75", "76", "77", "78", "79", "7a", "7b", "7c", "7d", "7e", "7f",
+    "80", "81", "82", "83", "84", "85", "86", "87", "88", "89", "8a", "8b", "8c", "8d", "8e", "8f",
+    "90", "91", "92", "93", "94", "95", "96", "97", "98", "99", "9a", "9b", "9c", "9d", "9e", "9f",
+    "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8", "a9", "aa", "ab", "ac", "ad", "ae", "af",
+    "b0", "b1", "b2", "b3", "b4", "b5", "b6", "b7", "b8", "b9", "ba", "bb", "bc", "bd", "be", "bf",
+    "c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "ca", "cb", "cc", "cd", "ce", "cf",
+    "d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7", "d8", "d9", "da", "db", "dc", "dd", "de", "df",
+    "e0", "e1", "e2", "e3", "e4", "e5", "e6", "e7", "e8", "e9", "ea", "eb", "ec", "ed", "ee", "ef",
+    "f0", "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "fa", "fb", "fc", "fd", "fe", "ff",
+];
 
 /* represents a fully decoded x86_64 machine instruction */
 #[derive(Debug, Clone)]
@@ -18,6 +62,7 @@ pub struct DecodedInstruction {
     pub op_str: String,
     pub flow_control: FlowControl,
     pub instruction: Instruction,
+    pub formatted_hex: String,
 }
 
 impl DecodedInstruction {
@@ -72,6 +117,253 @@ impl DecodedInstruction {
             None
         }
     }
+
+    /* format instruction into styled ratatui spans according to active theme palette */
+    pub fn format_spans(&self, palette: &crate::theme::Palette, is_selected: bool) -> Vec<Span<'static>> {
+        if is_selected {
+            let cursor_style = Style::default()
+                .fg(crate::theme::to_color(palette.cursor_fg))
+                .bg(crate::theme::to_color(palette.cursor_bg))
+                .add_modifier(Modifier::BOLD);
+            return vec![
+                Span::styled(format!("{:<8} ", self.mnemonic), cursor_style),
+                Span::styled(self.op_str.clone(), cursor_style),
+            ];
+        }
+
+        let mut formatter = IntelFormatter::new();
+        let mut output = SpanFormatterOutput::new(palette);
+        formatter.format(&self.instruction, &mut output);
+
+        /* override mnemonic styling for control flow instructions */
+        if let Some(first) = output.spans.first_mut() {
+            let m_col = if self.is_call() {
+                palette.mnemonic_call
+            } else if self.is_conditional_branch() || self.is_unconditional_branch() {
+                palette.mnemonic_jump
+            } else if self.is_return() {
+                palette.mnemonic_ret
+            } else {
+                palette.mnemonic
+            };
+            first.style = Style::default()
+                .fg(crate::theme::to_color(m_col))
+                .add_modifier(Modifier::BOLD);
+        }
+
+        output.spans
+    }
+}
+
+/* iced-x86 FormatterOutput that styles disassembly tokens with Theme palette */
+pub struct SpanFormatterOutput<'a> {
+    pub spans: Vec<Span<'static>>,
+    palette: &'a crate::theme::Palette,
+}
+
+impl<'a> SpanFormatterOutput<'a> {
+    pub fn new(palette: &'a crate::theme::Palette) -> Self {
+        Self {
+            spans: Vec::with_capacity(8),
+            palette,
+        }
+    }
+}
+
+impl<'a> FormatterOutput for SpanFormatterOutput<'a> {
+    fn write(&mut self, text: &str, kind: FormatterTextKind) {
+        let col = match kind {
+            FormatterTextKind::Mnemonic => self.palette.mnemonic,
+            FormatterTextKind::Register => self.palette.register,
+            FormatterTextKind::Number => self.palette.immediate,
+            FormatterTextKind::Punctuation | FormatterTextKind::Operator => {
+                if text == "[" || text == "]" || text == "+" || text == "*" {
+                    self.palette.memory_bracket
+                } else {
+                    self.palette.foreground
+                }
+            }
+            FormatterTextKind::LabelAddress | FormatterTextKind::FunctionAddress => {
+                self.palette.branch_target
+            }
+            FormatterTextKind::Keyword | FormatterTextKind::Directive => self.palette.keyword,
+            _ => self.palette.foreground,
+        };
+
+        self.spans.push(Span::styled(
+            text.to_string(),
+            Style::default().fg(crate::theme::to_color(col)),
+        ));
+    }
+}
+
+/*
+ * instruction cache backed by an LRU eviction policy and pre-indexed offset map.
+ * Caches decoded iced-x86 instructions by file offset so cursor navigation (j/k)
+ * and viewport virtualization operate in O(1) time without repeating raw byte decodes.
+ */
+#[derive(Debug, Clone)]
+pub struct InstructionCache {
+    pub capacity: usize,
+    pub entries: HashMap<usize, (DecodedInstruction, u64)>,
+    pub access_counter: u64,
+    pub known_offsets: Vec<usize>,
+}
+
+impl InstructionCache {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(512),
+            entries: HashMap::with_capacity(capacity.max(512)),
+            access_counter: 0,
+            known_offsets: Vec::new(),
+        }
+    }
+
+    /* retrieve decoded instruction from cache in O(1) time */
+    pub fn get(&mut self, offset: usize) -> Option<&DecodedInstruction> {
+        self.access_counter += 1;
+        let counter = self.access_counter;
+        if let Some(entry) = self.entries.get_mut(&offset) {
+            entry.1 = counter;
+            Some(&entry.0)
+        } else {
+            None
+        }
+    }
+
+    /* insert decoded instruction into cache, evicting LRU entry when at capacity */
+    pub fn insert(&mut self, offset: usize, instr: DecodedInstruction) {
+        if self.entries.len() >= self.capacity && !self.entries.contains_key(&offset) {
+            if let Some((&lru_offset, _)) = self.entries.iter().min_by_key(|(_, (_, acc))| *acc) {
+                self.entries.remove(&lru_offset);
+            }
+        }
+
+        self.access_counter += 1;
+        self.entries.insert(offset, (instr, self.access_counter));
+
+        if let Err(pos) = self.known_offsets.binary_search(&offset) {
+            self.known_offsets.insert(pos, offset);
+        }
+    }
+
+    /* get or decode a single instruction at given offset */
+    pub fn get_or_decode(
+        &mut self,
+        bytes: &[u8],
+        offset: usize,
+        va: u64,
+    ) -> Option<DecodedInstruction> {
+        if let Some(cached) = self.get(offset) {
+            return Some(cached.clone());
+        }
+
+        if offset >= bytes.len() {
+            return None;
+        }
+
+        let slice = &bytes[offset..bytes.len().min(offset + 15)];
+        let mut decoder = Decoder::with_ip(64, slice, va, DecoderOptions::NONE);
+        if !decoder.can_decode() {
+            return None;
+        }
+
+        let instr = decoder.decode();
+        let len = instr.len();
+        if len == 0 || offset + len > bytes.len() {
+            return None;
+        }
+
+        let instr_bytes = bytes[offset..offset + len].to_vec();
+        let mut formatter = IntelFormatter::new();
+        let mut disasm = String::new();
+        formatter.format(&instr, &mut disasm);
+
+        let (mnemonic, op_str) = match disasm.split_once(' ') {
+            Some((m, ops)) => (m.to_string(), ops.trim().to_string()),
+            None => (disasm.clone(), String::new()),
+        };
+
+        let mut formatted_hex = String::with_capacity(len * 3);
+        for (i, &b) in instr_bytes.iter().enumerate() {
+            if i > 0 {
+                formatted_hex.push(' ');
+            }
+            formatted_hex.push_str(HEX_BYTE[b as usize]);
+        }
+
+        let decoded = DecodedInstruction {
+            va,
+            file_offset: offset,
+            len,
+            bytes: instr_bytes,
+            disasm,
+            mnemonic,
+            op_str,
+            flow_control: instr.flow_control(),
+            instruction: instr,
+            formatted_hex,
+        };
+
+        self.insert(offset, decoded.clone());
+        Some(decoded)
+    }
+
+    /* locate next instruction offset in O(1) */
+    pub fn next_offset(&self, offset: usize) -> Option<usize> {
+        match self.known_offsets.binary_search(&offset) {
+            Ok(idx) => self.known_offsets.get(idx + 1).copied(),
+            Err(idx) => self.known_offsets.get(idx).copied(),
+        }
+    }
+
+    /* locate previous instruction offset in O(1) */
+    pub fn prev_offset(&self, offset: usize) -> Option<usize> {
+        match self.known_offsets.binary_search(&offset) {
+            Ok(idx) => if idx > 0 { self.known_offsets.get(idx - 1).copied() } else { None },
+            Err(idx) => if idx > 0 { self.known_offsets.get(idx - 1).copied() } else { None },
+        }
+    }
+
+    /* pre-populate cache from a sequence of decoded instructions */
+    pub fn populate(&mut self, instructions: &[DecodedInstruction]) {
+        for instr in instructions {
+            self.insert(instr.file_offset, instr.clone());
+        }
+    }
+
+    /* pre-index a contiguous range of instructions into the cache */
+    pub fn preindex_range(
+        &mut self,
+        bytes: &[u8],
+        start_offset: usize,
+        base_va: u64,
+        max_count: usize,
+    ) {
+        let mut cur_off = start_offset;
+        let mut cur_va = base_va;
+        let mut count = 0;
+
+        while cur_off < bytes.len() && count < max_count {
+            if let Some(instr) = self.get_or_decode(bytes, cur_off, cur_va) {
+                let len = instr.len;
+                cur_off += len;
+                cur_va += len as u64;
+                count += 1;
+            } else {
+                cur_off += 1;
+                cur_va += 1;
+            }
+        }
+    }
+
+    /* clear cached entries upon binary patching */
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.known_offsets.clear();
+        self.access_counter = 0;
+    }
 }
 
 /*
@@ -111,6 +403,14 @@ pub fn disassemble_slice(
             None => (disasm.clone(), String::new()),
         };
 
+        let mut formatted_hex = String::with_capacity(len * 3);
+        for (i, &b) in instr_bytes.iter().enumerate() {
+            if i > 0 {
+                formatted_hex.push(' ');
+            }
+            formatted_hex.push_str(HEX_BYTE[b as usize]);
+        }
+
         instructions.push(DecodedInstruction {
             va: ip,
             file_offset: base_file_offset + rel_off,
@@ -121,6 +421,7 @@ pub fn disassemble_slice(
             op_str,
             flow_control: instr.flow_control(),
             instruction: instr,
+            formatted_hex,
         });
     }
 
